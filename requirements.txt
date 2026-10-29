@@ -1,0 +1,10 @@
+# Verified together on Python 3.12.14. Python 3.11+ required.
+streamlit==1.66.1
+pandas==3.1.0
+gspread==6.2.1
+google-genai==2.33.0
+google-api-python-client==2.201.0
+google-auth==2.62.0
+Pillow==13.0.0
+openpyxl==3.1.5
+pypdf==6.10.0
