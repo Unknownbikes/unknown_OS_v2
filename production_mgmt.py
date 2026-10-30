@@ -13,8 +13,10 @@ import hmac
 import io
 import json
 import math
+import random
 import re
 import threading
+import time
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -24,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import pandas as pd
 import streamlit as st
 
-VERSION = "7.0.0"
+VERSION = "7.0.1"
 KST = timezone(timedelta(hours=9))
 EVENT_TAB = "운영V2_이벤트"
 EVENT_HEADER = ["거래ID", "조각", "조각수", "SHA256", "내용", "작업자", "일시"]
@@ -585,25 +587,58 @@ def extract_drive_ids(values):
     return ids
 
 
+def backup_read(call):
+    """Retry only transient read failures; never retry a write or permission error."""
+    for attempt in range(7):
+        try:
+            return call()
+        except Exception as exc:
+            status = getattr(exc, "code", None)
+            if status is None:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status not in (429, 500, 502, 503, 504) or attempt == 6:
+                raise
+            time.sleep(min(2 ** attempt, 32) + random.random())
+
+
+def backup_sheet_values(sh, worksheets, render_option):
+    """Read all tabs in batches while retaining the rectangular backup format."""
+    tables = []
+    for start in range(0, len(worksheets), 25):
+        batch = worksheets[start:start + 25]
+        ranges = ["'" + ws.title.replace("'", "''") + "'" for ws in batch]
+        response = backup_read(lambda: sh.values_batch_get(
+            ranges, params={"valueRenderOption": render_option, "majorDimension": "ROWS"}))
+        values = response.get("valueRanges", [])
+        if len(values) != len(batch):
+            raise IntegrityError("일부 시트가 백업 응답에서 누락되었습니다. 다시 시도하세요.")
+        for item in values:
+            rows = item.get("values", [])
+            width = max((len(row) for row in rows), default=0)
+            tables.append([list(row) + [""] * (width - len(row)) for row in rows])
+    return tables
+
+
 def build_backup(ctx, include_files=True):
     """Read-only backup of all connected worksheets + reachable Drive files.
     No secrets are exported. Fails closed rather than reporting partial success.
     """
-    from googleapiclient.http import MediaIoBaseDownload
     files, manifests, linked = {}, [], set()
     sources = ctx.get("backup_sources") or {"생산": ctx["key"], "위챗": ctx.get("wechat_key", ctx["key"])}
     for key in dict.fromkeys(sources.values()):
-        sh = ctx["get_sh"](key)
+        sh = backup_read(lambda: ctx["get_sh"](key))
+        worksheets = backup_read(sh.worksheets)
+        all_values = backup_sheet_values(sh, worksheets, "FORMATTED_VALUE")
+        all_formulas = backup_sheet_values(sh, worksheets, "FORMULA")
         sheets = []
-        for ws in sh.worksheets():
-            vals = ws.get_all_values()
-            formulas = ws.get_all_values(value_render_option="FORMULA")
+        for ws, vals, formulas in zip(worksheets, all_values, all_formulas):
             sheets.append({"title": ws.title, "sheet_id": ws.id, "values": vals, "formulas": formulas})
             linked |= extract_drive_ids(vals)
             manifests.append({"spreadsheet": key, "sheet": ws.title, "rows": len(vals), "sha256": digest(dumps(vals))})
         files[f"sheets/{key}.json"] = dumps({"key": key, "sheets": sheets}).encode("utf-8")
     drive = ctx.get("drive_service")
     if include_files:
+        from googleapiclient.http import MediaIoBaseDownload
         if not drive:
             raise RuntimeError("Drive 연결이 없어 첨부 백업을 완료할 수 없습니다.")
         if ctx.get("drive_folder"):
